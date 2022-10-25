@@ -1,0 +1,626 @@
+#!/system/bin/sh
+
+# ----------------------
+# SMOOTH TWEAKS 💕 
+# Author: @DESIRE_TM🥀
+# ----------------------
+
+# ----------------------
+# Powersave
+# ----------------------
+
+# Maximum unsigned integer size in C
+UINT_MAX="4294967295"
+
+# Get total size memory
+memTotal=$(free -m | awk '/^Mem:/{print $2}')
+
+# Duration in nanoseconds of one scheduling period
+SCHED_PERIOD=$((4*1000*1000))
+
+# How many tasks should we have at a maximum in one scheduling period
+SCHED_TASKS="8"
+
+# ---------------------- 
+# Basic tool functions
+# ---------------------- 
+# Safely write value to file
+write() {
+  # Bail out if file does not exist
+  if [[ ! -e "$2" ]]; then
+    echo "🔸Error $1 --> $2"
+	return 1
+  fi
+	
+  current=$(cat "$2")
+
+	# Bail out if value is already set
+  if [[ "$current" == "$1" ]]; then
+    echo "🔹Success: $current --> $1 $2"
+	return 0
+  fi
+
+  # Write the new value
+  chmod 0666 "$2" 2>/dev/null
+  echo "$1" > "$2"
+
+  # Bail out if write fails
+  if [[ $? -ne 0 ]]; then
+    echo "🔸Failed set $1 to $2"
+	return 1
+  fi
+
+  echo "🔹Success: $current --> $1 $2"
+  
+  # Guide: Write $1 = Value | $2 = Task/Directory
+}
+
+set_cpufreq_min() {
+  write "$1" /sys/module/msm_performance/parameters/cpu_min_freq
+  local key
+  local val
+  for kv in $1; do
+    key=${kv%:*}
+    val=${kv#*:}
+    write "$val" /sys/devices/system/cpu/cpu$key/cpufreq/scaling_min_freq
+  done
+}
+
+set_cpufreq_max() {
+  write "$1" /sys/module/msm_performance/parameters/cpu_max_freq
+  local key
+  local val
+  for kv in $1; do
+    key=${kv%:*}
+    val=${kv#*:}
+    write "$val" /sys/devices/system/cpu/cpu$key/cpufreq/scaling_max_freq
+  done
+}
+
+# ----------------------
+# Main script
+# ----------------------
+
+# OpenGl
+resetprop debug.hwui.renderer "opengl"
+
+# Unify SF props
+resetprop debug.sf.latch_unsignaled "1"
+resetprop debug.sf.disable_backpressure "1"
+
+# Disable Dyn. Fps
+resetprop ro.vendor.dfps.enable "false"
+resetprop ro.vendor.smart_dfps.enable "false"
+
+# Wifi scaning
+resetprop wifi.supplicant_scan_interval "180"
+
+# Zygote
+resetprop ro.zygote.disable_gl_preload "false"
+
+# Powersave
+resetprop power.saving.mode "1"
+resetprop pm.sleep_mode "3"
+resetprop ro.ril.disable.power.collapse "0"
+resetprop ro.ril.power_collapse "1"
+
+# GPU settings
+for gpu in /sys/class/kgsl/kgsl-3d0; do
+  write "0" $gpu/max_pwrlevel
+  write "0" $gpu/adrenoboost
+  write "N" $gpu/adreno_idler_active
+  write "1" $gpu/throttling
+  write "1" $gpu/bus_split
+  write "0" $gpu/force_clk_on
+  write "0" $gpu/force_bus_on
+  write "0" $gpu/force_rail_on
+  write "0" $gpu/force_no_nap
+  write "80" $gpu/idle_timer
+  write $UINT_MAX $gpu/min_pwrlevel
+done
+
+# Swith gpu governor
+if grep 'userspace' /sys/class/kgsl/kgsl-3d0/devfreq/available_governors; then
+  write 'userspace' /sys/class/kgsl/kgsl-3d0/devfreq/governor
+elif grep 'msm-adreno-tz' /sys/class/kgsl/kgsl-3d0/devfreq/available_governors; then
+  write 'msm-adreno-tz' /sys/class/kgsl/kgsl-3d0/devfreq/governor
+fi
+
+# Limit thermal ignore
+glti=/proc/gpufreq/gpufreq_limited_thermal_ignore
+if [[ -e "$glti" ]]; then
+  write "0" $glti
+fi
+
+if grep "interactive" /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors; then
+  for cpus in 0 1 2 3 4 5 6 7 8 9; do
+    write "interactive" /sys/devices/system/cpu/cpu$cpus/cpufreq/scaling_governor
+  done
+elif grep "schedutil" /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors; then
+  for cpus in 0 1 2 3 4 5 6 7 8 9; do
+    write "schedutil" /sys/devices/system/cpu/cpu$cpus/cpufreq/scaling_governor
+  done
+fi
+
+# Set max freq for all cpu's
+set_cpufreq_min "0:0 1:0 2:0 3:0 4:0 5:0 6:0 7:0"
+set_cpufreq_max "0:9999000 1:9999000 2:9999000 3:9999000 4:9999000 5:9999000 6:9999000 7:9999000"
+
+# Apply governor specific tunables for schedutil
+find /sys/devices/system/cpu/ -name schedutil -type d | while IFS= read -r governor; do
+  # Consider changing frequencies once per scheduling period
+  write $((SCHED_PERIOD/1000)) $governor/up_rate_limit_us
+  write $((4*SCHED_PERIOD/1000)) $governor/down_rate_limit_us
+  write $((SCHED_PERIOD/1000)) $governor/rate_limit_us
+done
+
+# Apply governor specific tunables for interactive
+find /sys/devices/system/cpu/ -name interactive -type d | while IFS= read -r governor; do
+  # Consider changing frequencies once per scheduling period
+  write $((SCHED_PERIOD/1000)) $governor/timer_rate
+  write $((SCHED_PERIOD/1000)) $governor/min_sample_time
+done
+
+# Zram
+low_ram=$(getprop ro.config.low_ram)
+if [[ "$low_ram" == "true" ]]; then
+  write "lz4" /sys/block/zram*/comp_algorithm
+fi
+
+swapoff /dev/block/zram* 2>/dev/null
+write "1" /sys/block/zram*/reset
+write "0" /sys/block/zram*/disksize
+
+if [[ "$memTotal" -le "512" ]]; then
+  write "402653184" /sys/block/zram*/disksize
+elif [[ "$memTotal" -le "1024" ]]; then
+  write "805306368" /sys/block/zram*/disksize
+elif [[ "$memTotal" -le "2048" ]]; then
+  write "1610612736" /sys/block/zram*/disksize
+elif [[ "$memTotal" -le "3072" ]]; then
+  write "1610612736" /sys/block/zram*/disksize
+elif [[ "$memTotal" -le "4096" ]]; then
+  write "2147483648" /sys/block/zram*/disksize
+elif [[ "$memTotal" -le "6144" ]]; then
+  write "3221225472" /sys/block/zram*/disksize
+elif [[ "$memTotal" -le "8192" ]]; then
+  write "4294967296" /sys/block/zram*/disksize
+else
+  write "4294967296" /sys/block/zram*/disksize
+fi
+
+mkswap /dev/block/zram*
+swapon /dev/block/zram* -p 32758
+
+# Set up for max background apps
+if [[ "$memTotal" -le "512" ]]; then
+  backgroundAppLimit="16"
+elif [[ "$memTotal" -le "1024" ]]; then
+  backgroundAppLimit="24"
+elif [[ "$memTotal" -le "2048" ]]; then
+  backgroundAppLimit="28"
+elif [[ "$memTotal" -le "3072" ]]; then
+  backgroundAppLimit="30"
+elif [[ "$memTotal" -le "4096" ]]; then
+  backgroundAppLimit="36"
+else
+  backgroundAppLimit="42"
+fi
+
+# Memory properties
+resetprop ro.vendor.qti.sys.fw.bservice_enable "true"
+resetprop ro.vendor.qti.sys.fw.bservice_age "5000"
+resetprop ro.sys.fw.bg_apps_limit $backgroundAppLimit
+resetprop ro.vendor.qti.sys.fw.bg_apps_limit $backgroundAppLimit
+
+# Disable JIT
+resetprop dalvik.vm.dexopt-flags "v=n,o=n,m=n,u=n"
+resetprop debug.usejit "false"
+resetprop dalvik.vm.usejit "false"
+resetprop dalvik.vm.usejitprofiles "false"
+
+# JIT - limit JIT to minimal verification, no use of profiles.
+resetprop dalvik.vm.image-dex2oat-filter "verify-at-runtime"
+resetprop pm.dexopt.first-boot "verify-at-runtime"
+resetprop pm.dexopt.boot "verify-at-runtime"
+resetprop pm.dexopt.install "interpret-only"
+resetprop pm.dexopt.ab-ota "quicken"
+resetprop pm.dexopt.core-app "quicken"
+resetprop pm.dexopt.bg-dexopt "quicken"
+resetprop pm.dexopt.shared-apk "quicken"
+resetprop pm.dexopt.nsys-library "quicken"
+resetprop pm.dexopt.forced-dexopt "quicken"
+
+# JIT - reduce verifications with dex checksum before launch, and reduce logs.
+resetprop dalvik.vm.check-dex-sum "false"
+resetprop dalvik.vm.checkjni "false"
+resetprop dalvik.vm.verify-bytecode "false"
+resetprop debug.atrace.tags.enableflags "0"
+resetprop ro.config.dmverity "false"
+resetprop ro.config.htc.nocheckin "1"
+resetprop ro.config.nocheckin "1"
+resetprop ro.dalvik.vm.native.bridge "0"
+resetprop ro.kernel.android.checkjni "0"
+resetprop ro.kernel.checkjni "0"
+resetprop dalvik.vm.dex2oat-minidebuginfo "false"
+resetprop dalvik.vm.minidebuginfo "false"
+
+# Hypertheading & Multithread
+resetprop persist.sys.dalvik.hyperthreading "true"
+resetprop persist.sys.dalvik.multithread "true"
+
+upgrade_miui() {
+# Check if we're running MIUI
+  [[ "$(getprop ro.miui.ui.version.name)" ]] && miui=true
+  
+  [[ "$miui" == "true" ]] && {
+  # Cpu sets
+  write "0-2,4-7" /dev/cpuset/foreground/cpus
+  }
+
+  nr_cores=$(cat /sys/devices/system/cpu/possible | awk -F "-" '{print $2}')
+  nr_cores=$((nr_cores+1))
+
+  [[ "$nr_cores" -eq "0" ]] && nr_cores=1
+
+  [[ "$miui" == "true" ]] && [[ "$nr_cores" == "8" ]] && {
+  resetprop persist.sys.miui.sf_cores "4-7"
+  resetprop persist.sys.miui_animator_sched.bigcores "4-7"
+  }
+
+  [[ "$miui" == "true" ]] && [[ "$nr_cores" == "6" ]] && {
+  resetprop persist.sys.miui.sf_cores "0-5"
+  resetprop persist.sys.miui_animator_sched.bigcores "2-5"
+  }
+
+  [[ "$miui" == "true" ]] && [[ "$nr_cores" == "4" ]] && {
+  resetprop persist.sys.miui.sf_cores "0-3"
+  resetprop persist.sys.miui_animator_sched.bigcores "0-3"
+  }
+}
+
+for net in /proc/sys/net; do
+  write "3" $net/ipv4/tcp_fastopen
+  write "1" $net/ipv4/tcp_ecn
+  write "0" $net/ipv4/tcp_syncookies
+    
+  # TCP congestion control
+  if grep "westwood" $net/ipv4/tcp_available_congestion_control; then
+    write "westwood" $net/ipv4/tcp_congestion_control
+  fi
+done
+
+# Core control 
+for hotplug in /sys/devices/system/cpu; do
+  write "0" $hotplug/cpu0/core_ctl/enable
+
+  write "1" $hotplug/cpu4/core_ctl/enable
+  write "2" $hotplug/cpu4/core_ctl/min_cpus
+  write "60" $hotplug/cpu4/core_ctl/busy_up_thres
+  write "30" $hotplug/cpu4/core_ctl/busy_down_thres
+  write "100" $hotplug/cpu4/core_ctl/offline_delay_ms
+
+  write "1" $hotplug/cpu7/core_ctl/enable
+  write "0" $hotplug/cpu7/core_ctl/min_cpus
+  write "60" $hotplug/cpu7/core_ctl/busy_up_thres
+  write "30" $hotplug/cpu7/core_ctl/busy_down_thres
+  write "100" $hotplug/cpu7/core_ctl/offline_delay_ms
+done
+
+# Define TCP buffer sizes for various networks
+resetprop net.tcp.buffersize.default "6144,87380,1048576,6144,87380,524288"
+resetprop net.tcp.buffersize.wifi "524288,1048576,2097152,524288,1048576,2097152"
+resetprop net.tcp.buffersize.umts "6144,87380,1048576,6144,87380,524288"
+resetprop net.tcp.buffersize.gprs "6144,87380,1048576,6144,87380,524288"
+resetprop net.tcp.buffersize.edge "6144,87380,524288,6144,16384,262144"
+resetprop net.tcp.buffersize.hspa "6144,87380,524288,6144,16384,262144"
+resetprop net.tcp.buffersize.lte "524288,1048576,2097152,524288,1048576,2097152"
+resetprop net.tcp.buffersize.hsdpa "6144,87380,1048576,6144,87380,1048576"
+resetprop net.tcp.buffersize.evdo_b "6144,87380,1048576,6144,87380,1048576"
+
+# Set up for kernel sched
+for sched_kernel in /proc/sys/kernel; do
+  write "0" $sched_kernel/sched_boost
+  write "0" $sched_kernel/timer_migration
+  write "0" $sched_kernel/sched_tunable_scaling
+  write "0" $sched_kernel/sched_child_runs_first
+  write "0" $sched_kernel/sched_autogroup_enabled
+  write "1" $sched_kernel/sched_walt_rotate_big_tasks
+  write "95 85" $sched_kernel/sched_upmigrate
+  write "95 60" $sched_kernel/sched_downmigrate
+  write "32" $sched_kernel/sched_nr_migrate
+  write "15" $sched_kernel/perf_cpu_time_max_percent
+  write "100" $sched_kernel/sched_rr_timeslice_ns
+  write "1000000" $sched_kernel/sched_rt_period_us
+  write "950000" $sched_kernel/sched_rt_runtime_us
+  write "5000000" $sched_kernel/sched_migration_cost_ns
+  write $SCHED_PERIOD $sched_kernel/sched_latency_ns
+  write $((SCHED_PERIOD/SCHED_TASKS)) $sched_kernel/sched_min_granularity_ns
+  write $((SCHED_PERIOD/2)) $sched_kernel/sched_wakeup_granularity_ns
+done
+
+# Set up for Cpusets
+rmdir /dev/cpuset/foreground/boost
+write "0-1" /dev/cpuset/background/cpus
+write "0-3" /dev/cpuset/system-background/cpus
+write "0-2,4-6" /dev/cpuset/foreground/cpus
+write "0-7" /dev/cpuset/top-app/cpus
+write "0-3" /dev/cpuset/restricted/cpus
+write "0-7" /dev/cpuset/camera-daemon/cpus
+
+# Entropy
+write "128" /proc/sys/kernel/random/read_wakeup_threshold
+write "256" /proc/sys/kernel/random/write_wakeup_threshold
+
+# Cpu Efficient
+write "Y" /sys/module/workqueue/parameters/power_efficient
+
+# Enable multi core power saving
+mcps="/sys/devices/system/cpu/sched_mc_power_savings"
+if [[ -e $mcps ]]; then
+  write "1" $mcps
+fi
+
+# Multi User Support
+for gms in $(ls /data/user/); do
+  # Disable collective Device administrators
+  pm disable com.google.android.gms/com.google.android.gms.auth.managed.admin.DeviceAdminReceiver
+  pm disable com.google.android.gms/com.google.android.gms.mdm.receivers.MdmDeviceAdminReceiver
+done
+
+# FileSystem (FS) optimized tweaks & enhancements
+write "0" /proc/sys/fs/dir-notify-enable
+write "50" /proc/sys/fs/lease-break-time
+write "0" /proc/sys/kernel/hung_task_timeout_secs
+
+# LMK
+write "0" /sys/module/lowmemorykiller/parameters/lmk_fast_run
+write "0" /sys/module/lowmemorykiller/parameters/debug_level
+write "0" /sys/module/lowmemorykiller/parameters/enable_adaptive_lmk
+
+# Kernel Panic Off
+write "0" /proc/sys/kernel/panic
+write "0" /proc/sys/kernel/panic_on_oops
+write "0" /proc/sys/kernel/panic_on_warn
+write "0" /proc/sys/kernel/panic_on_rcu_stall
+write "0" /sys/module/kernel/parameters/panic
+write "0" /sys/module/kernel/parameters/panic_on_warn
+write "0" /sys/module/kernel/parameters/pause_on_oops
+write "0" /sys/module/kernel/panic_on_rcu_stall
+
+# Virtual memory
+for virtual_memory in /proc/sys/vm; do
+  write "0" $virtual_memory/page-cluster
+  write "0" $virtual_memory/oom_kill_allocating_task
+  write "0" $virtual_memory/oom_dump_tasks
+  write "20" $virtual_memory/stat_interval
+  write "80" $virtual_memory/vfs_cache_pressure
+  write "100" $virtual_memory/swappiness
+  write "1000" $virtual_memory/dirty_expire_centisecs
+  write "500" $virtual_memory/dirty_writeback_centisecs
+done
+
+if [[ "$memTotal" -lt "524288" ]]; then
+  write "15" /proc/sys/vm/dirty_background_ratio
+  write "30" /proc/sys/vm/dirty_ratio
+elif [[ "$memTotal" -lt "1049776" ]]; then
+  write "10" /proc/sys/vm/dirty_background_ratio
+  write "20" /proc/sys/vm/dirty_ratio
+else
+  write "5" /proc/sys/vm/dirty_background_ratio
+  write "10" /proc/sys/vm/dirty_ratio
+fi
+
+# Set up for I/O Scheduler
+for scheduler in /sys/block/sd*/queue; do
+  write "noop" $scheduler/scheduler
+  write "128" $scheduler/read_ahead_kb
+  write "64" $scheduler/nr_requests
+  write "0" $scheduler/iostats
+  write "0" $scheduler/add_random
+  write "0" $scheduler/nomerges
+  write "1" $scheduler/rq_affinity
+  write "0" $scheduler/rotational
+done
+
+# Loop
+for loop in /sys/block/loop*/queue; do
+  write "none" $loop/scheduler
+  write "128" $loop/read_ahead_kb
+done
+
+# Mmcblk
+for mmcblk in /sys/block/mmcblk*/queue; do
+  write "512" $mmcblk/read_ahead_kb
+  write "0" $mmcblk/iostats
+done
+
+# Dm
+for dm in /sys/block/dm*/queue; do
+  write "0" $dm/iostats
+done
+
+# Zram
+for zram in /sys/block/zram0/queue; do
+  write "deadline" /sys/block/zram0/queue/scheduler
+  write "1024" /sys/block/zram0/queue/read_ahead_kb
+done
+
+# Set up for ioshed, disable idle
+for iosched in /sys/block/*/iosched; do
+  write "0" $iosched/slice_idle
+  write "0" $iosched/slice_idle_us
+  write "0" $iosched/group_idle
+  write "0" $iosched/group_idle_us
+  write "0" $iosched/low_latency
+done
+
+# Sd card
+if [[ -e "/sys/devices/virtual/bdi/179:0/read_ahead_kb" ]]; then
+  write "2048" /sys/devices/virtual/bdi/179:0/read_ahead_kb
+fi
+
+# Set up for Stune Boost
+write "0" /dev/stune/schedtune.boost
+write "0" /dev/stune/schedtune.sched_boost_no_override
+write "0" /dev/stune/schedtune.prefer_idle
+write "0" /dev/stune/schedtune.colocate
+write "0" /dev/stune/cgroup.clone_children
+
+for stune in /dev/stune/*/; do
+  write "0" $stune/schedtune.boost
+  write "0" $stune/schedtune.sched_boost_no_override
+  write "0" $stune/schedtune.prefer_idle
+  write "0" $stune/schedtune.colocate
+  write "0" $stune/cgroup.clone_children
+done
+
+# Clear uclamp
+for uclamp in /dev/cpuctl/*; do
+  write "0" $uclamp/cpu.uclamp.min
+  write "0" $uclamp/cpu.uclamp.latency_sensitive
+done
+
+# LMP
+for lmp in /sys/module/lpm_levels/parameters; do
+  write "0" $lmp/lpm_ipi_prediction
+  write "0" $lmp/lpm_prediction
+  write "0" $lmp/sleep_disabled
+done
+
+# Featutes
+if [[ -e "/sys/kernel/debug/sched_features" ]]; then
+  # Consider scheduling tasks that are eager to run
+  write "NEXT_BUDDY" /sys/kernel/debug/sched_features
+
+  # Schedule tasks on their origin CPU if possible
+  write "TTWU_QUEUE" /sys/kernel/debug/sched_features
+fi
+
+# Off Ramdumps
+if [[ -e "/sys/module/subsystem_restart/parameters" ]]; then
+  write "0" /sys/module/subsystem_restart/parameters/enable_ramdumps
+  write "0" /sys/module/subsystem_restart/parameters/enable_mini_ramdumps
+fi
+
+# Disabling ksm
+ksm="/sys/kernel/mm/ksm/run"
+if [ -e "$ksm" ]; then
+  write "0" $ksm
+fi
+
+# Disabling uksm
+uksm="/sys/kernel/mm/uksm/run"
+if [ -e "$uksm" ]; then
+  write "0" $uksm
+fi
+
+# Script for delete apps
+function delete()
+{
+  if pm list packages -e 2>/dev/null | grep $1; then
+  su -c pm uninstall --user 0 $1
+  fi
+}
+
+delete com.miui.analytics # Deleting background logs
+delete com.miui.msa.global # Miui System Ads = MSA
+delete com.facebook.services # Uselles facebook services
+delete com.facebook.system # Uselles facebook services
+delete com.facebook.appmanager # Uselles facebook services
+delete com.android.traceur # Deleting background logs
+delete com.android.bookmarkprovider # Bookmark Povider
+delete com.android.providers.partnerbookmarks # Ads on Chrome
+delete com.xiaomi.joyose # Uselles
+delete com.bsp.catchlog # Deleting background logs
+
+su -c pm disable com.miui.daemon # Disabling background logs
+
+# Disable logs & debuggers
+for exception_trace in $(find /proc/sys/ -name exception-trace); do
+  write "0" $exception_trace
+done
+
+for sched_schedstats in $(find /proc/sys/ -name sched_schedstats); do
+  write "0" $sched_schedstats
+done
+
+for printk in $(find /proc/sys/ -name printk); do
+  write "0 0 0 0" $printk
+done
+
+for printk_devkmsg in $(find /proc/sys/ -name printk_devkmsg); do
+  write "off" $printk_devkmsg
+done
+
+for compat_log in $(find /proc/sys/ -name compat-log); do
+  write "0" $compat_log
+done
+
+for tracing_on in $(find /proc/sys/ -name tracing_on); do
+  write "0" $tracing_on
+done
+
+for log_level in $(find /sys/ -name log_level*); do
+  write "0" $log_level
+done
+
+for debug_mask in $(find /sys/ -name debug_mask); do
+  write "0" $debug_mask
+done
+
+for debug_level in $(find /sys/ -name debug_level); do
+  write "0" $debug_level
+done
+
+for log_ue in $(find /sys/ -name *log_ue*); do
+  write "0" $log_ue
+done
+
+for log_ce in $(find /sys/ -name *log_ce*); do
+  write "0" $log_ce
+done
+
+for edac_mc_log in $(find /sys/ -name edac_mc_log*); do
+  write "0" $edac_mc_log
+done
+
+for enable_event_log in $(find /sys/ -name enable_event_log); do
+  write "0" $enable_event_log
+done
+
+for log_ecn_error in $(find /sys/ -name log_ecn_error); do
+  write "0" $log_ecn_error
+done
+
+for sec_log in $(find /sys/ -name sec_log*); do
+  write "0" $sec_log
+done
+
+for snapshot_crashdumper in $(find /sys/ -name snapshot_crashdumper); do
+  write "0" $snapshot_crashdumper
+done
+
+# Remove main log
+if [[ -e "/dev/log/main" ]]; then
+  rm -f /dev/log/main
+fi
+
+# Stop services
+su -c stop logd
+su -c stop tcpdump
+su -c stop cnss_diag
+su -c stop statsd
+su -c stop traced
+su -c stop miuibooster
+su -c stop vendor.perfservice
+
+# Apply settings for miui
+upgrade_miui
+
+# Find cache
+find /data/data/*/cache/* -delete &>/dev/null
+find /sdcard/Android/data/*/cache/* -delete &>/dev/null
+
+# Exit script
+exit 0
