@@ -1,1 +1,1 @@
-[# UI_Tweak](https://telegra.ph/How-to-swith-profiles-10-14)
+https://telegra.ph/How-to-swith-profiles-10-14
